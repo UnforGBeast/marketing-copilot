@@ -29,7 +29,58 @@ An AI-powered assistant designed for marketing data engineers and analytics cons
 ### Installation
 
 1. **Clone the repository:**
-   
-```bash
+    ```bash
    git clone [https://github.com/yourusername/marketing-analytics-copilot.git](https://github.com/yourusername/marketing-analytics-copilot.git)
    cd marketing-analytics-copilot
+'''
+2. **Create and activate a virtual environment:**
+   ```bash
+   python -m venv venv     
+   # On Windows:
+   venv\Scripts\activate
+   # On macOS/Linux:
+   source venv/bin/activate
+```
+3. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+4. **Environment Setup:**
+   Create a .env file in the root directory and add your Gemini API key:
+   ```.env
+   GOOGLE_API_KEY=your_gemini_api_key_here
+   ```
+### Running the Application
+To avoid common Windows port-conflict issues, the backend is configured to run on port 8001. You will need two separate terminal windows to run the full stack.
+**Terminal 1: Start the FastAPI Backend**
+```bash
+cd backend
+python -m uvicorn main:app --reload --host 0.0.0.0 --port 8001
+```
+**Terminal 2: Start the Streamlit Frontend**
+```bash
+cd frontend
+streamlit run app.py
+```
+The UI will automatically open in your default browser at http://localhost:8501.
+
+##📂 Project Structure
+```Structure
+├── app.py                      # Streamlit frontend UI and session state
+├── main.py                     # FastAPI application, routing, and error handling
+├── orchestrator.py             # LangChain master orchestrator and system prompts
+├── conversation_manager.py     # Summarization, token estimation, and semantic search
+├── auditor_agent.py            # Specialized agent for parsing and analyzing GTM files
+├── .env                        # Environment variables (API keys)
+└── README.md                   # Project documentation
+```
+##🧪 Testing & Resilience
+The application includes robust error handling and UI protections engineered during Sprint 3:
+
+Validation: Safely rejects invalid JSON/CSV uploads and malformed chat imports.
+
+Graceful Degradation: Continues functioning smoothly even if the embedding model fails or if summarization thresholds are not met.
+
+Domain Restriction Guardrails: The Master Orchestrator is strictly prompt-engineered to politely refuse off-topic requests (e.g., creative writing or non-marketing queries) to protect API costs and maintain professional focus.
+
+Zombie-Server Bypass: Architecture defaults to port 8001 to prevent Uvicorn background-process conflicts.
