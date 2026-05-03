@@ -15,8 +15,16 @@ from pydantic import BaseModel, Field, field_validator, ConfigDict
 from typing import Optional
 import os
 from dotenv import load_dotenv
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from orchestrator import process_query, OrchestratorError, get_orchestrator
+
+# Security Constants
+MAX_FILE_SIZE_MB = 10
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+MAX_MESSAGE_LENGTH = 2000
 
 # Load environment variables
 load_dotenv()
@@ -33,6 +41,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+# Initialize rate limiter
+limiter = Limiter(key_func=get_remote_address)
+
 # Initialize FastAPI app
 app = FastAPI(
     title="Marketing Analytics Copilot API",
@@ -42,16 +53,63 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-# CORS configuration
+# Add rate limiter to app state
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS configuration - Restrictive for security
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8501", "http://127.0.0.1:8501"],
+    allow_origins=[
+        os.getenv("FRONTEND_URL", "http://localhost:8501"),
+        "http://127.0.0.1:8501"
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],  # Only allow necessary methods
+    allow_headers=["Content-Type", "Authorization", "X-Request-ID"],
+    max_age=3600,  # Cache preflight for 1 hour
 )
 
-logger.info("FastAPI application initialized successfully")
+# Request size limit middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
+    """Middleware to limit request size for security."""
+    
+    def __init__(self, app, max_request_size: int = 15 * 1024 * 1024):
+        super().__init__(app)
+        self.max_request_size = max_request_size
+    
+    async def dispatch(self, request: Request, call_next):
+        if request.method in ["POST", "PUT", "PATCH"]:
+            content_length = request.headers.get("content-length")
+            if content_length and int(content_length) > self.max_request_size:
+                return JSONResponse(
+                    status_code=413,
+                    content={"error": "Request too large", "status": "error"}
+                )
+        return await call_next(request)
+
+app.add_middleware(RequestSizeLimitMiddleware, max_request_size=15 * 1024 * 1024)
+
+# Security headers middleware
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    """Add security headers to all responses."""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    
+    # Add HSTS in production
+    if os.getenv("ENVIRONMENT") == "production":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    
+    return response
+
+logger.info("FastAPI application initialized successfully with security middleware")
 
 
 # Pydantic models
@@ -60,7 +118,7 @@ class QueryRequest(BaseModel):
     message: str = Field(
         ...,
         min_length=1,
-        max_length=2000,
+        max_length=MAX_MESSAGE_LENGTH,
         description="User's message to the copilot"
     )
     
@@ -190,13 +248,17 @@ async def health_check():
     responses={
         200: {"model": QueryResponse, "description": "Successful response"},
         400: {"model": ErrorResponse, "description": "Invalid request"},
+        429: {"model": ErrorResponse, "description": "Too many requests"},
         503: {"model": ErrorResponse, "description": "Service unavailable"},
         500: {"model": ErrorResponse, "description": "Internal server error"}
     },
     tags=["Chat"]
 )
+@limiter.limit("20/minute")
+@limiter.limit("100/hour")
 async def chat_endpoint(
-    message: str = Form(..., min_length=1, max_length=2000),
+    request: Request,
+    message: str = Form(..., min_length=1, max_length=MAX_MESSAGE_LENGTH),
     file: Optional[UploadFile] = File(None),
     chat_history: str = Form("[]")
 ):
@@ -233,9 +295,7 @@ async def chat_endpoint(
     
     # Parse chat history
     parsed_history = []
-    print(f"\n--- DEBUG TC-3.02 ---")
-    print(f"RECEIVED HISTORY PAYLOAD: {chat_history}")
-    print(f"---------------------\n")
+    logger.debug(f"Received chat history payload: {len(chat_history)} chars")
     
     if chat_history and chat_history != "[]":
         try:
@@ -258,38 +318,7 @@ async def chat_endpoint(
                 status_code=400,
                 detail="Only JSON and CSV files are supported. Please upload a .json or .csv file."
             )
-        '''
-        # Check file size (10MB limit)
-        file.file.seek(0, 2)  # Seek to end
-        file_size = file.file.tell()
-        file.file.seek(0)  # Reset to beginning
         
-        if file_size > 10 * 1024 * 1024:  # 10MB
-            raise HTTPException(
-                status_code=400,
-                detail=f"File too large ({file_size / 1024 / 1024:.1f}MB). Maximum size is 10MB."
-            )
-        
-        # Read and decode file
-        try:
-            content_bytes = await file.read()
-            file_content = content_bytes.decode('utf-8')
-            file_type = 'json' if file.filename.endswith('.json') else 'csv'
-            logger.info(f"File decoded successfully - Type: {file_type}, Size: {len(file_content)} chars")
-        except UnicodeDecodeError:
-            logger.error("File decoding failed - not UTF-8")
-            raise HTTPException(
-                status_code=400,
-                detail="File must be UTF-8 encoded. Please save your file with UTF-8 encoding and try again."
-            )
-        
-        except Exception as e:
-            logger.error(f"File read error: {str(e)}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to read file: {str(e)}"
-            )
-            '''
         try:
             content_bytes = await file.read()
             
@@ -303,11 +332,11 @@ async def chat_endpoint(
                     detail="The uploaded file is empty. Please check the file and upload again."
                 )
                 
-            # Check for max size (10MB limit)
-            if file_size > 10 * 1024 * 1024:  
+            # Check for max size
+            if file_size > MAX_FILE_SIZE_BYTES:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"File too large ({file_size / 1024 / 1024:.1f}MB). Maximum size is 10MB."
+                    detail=f"File too large ({file_size / 1024 / 1024:.1f}MB). Maximum size is {MAX_FILE_SIZE_MB}MB."
                 )
             
             file_content = content_bytes.decode('utf-8')
@@ -376,15 +405,6 @@ async def startup_event():
         logger.critical(f"FATAL STARTUP ERROR: {str(e)}")
         # Explicitly crash the server because it cannot function without the AI
         sys.exit(1)
-'''
-@app.on_event("startup")
-async def startup_event():
-    """Log startup event."""
-    logger.info("=" * 60)
-    logger.info("Marketing Analytics Copilot API - Starting Up")
-    logger.info("Sprint 1: Walking Skeleton")
-    logger.info("=" * 60)
-'''
 
 @app.on_event("shutdown")
 async def shutdown_event():
