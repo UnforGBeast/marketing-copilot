@@ -11,6 +11,7 @@ This module handles the core AI orchestration logic, including:
 
 import os
 import logging
+import re
 from typing import Optional
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -31,6 +32,57 @@ class OrchestratorError(Exception):
     pass
 
 
+class PromptSecurityFilter:
+    """Filter and sanitize user inputs to prevent prompt injection attacks."""
+    
+    DANGEROUS_PATTERNS = [
+        r'ignore\s+(all\s+)?previous\s+instructions',
+        r'system\s+override',
+        r'you\s+are\s+now',
+        r'new\s+instructions',
+        r'disregard\s+',
+        r'forget\s+everything',
+        r'reveal\s+(api|key|secret|password)',
+        r'\[SYSTEM\]',
+        r'\[ADMIN\]',
+        r'<\|im_start\|>',
+        r'<\|im_end\|>',
+    ]
+    
+    MAX_PROMPT_LENGTH = 2000
+    MAX_SPECIAL_CHARS_RATIO = 0.3
+    
+    def sanitize_input(self, user_input: str) -> str:
+        """Sanitize user input to prevent injection attacks."""
+        
+        # 1. Length check
+        if len(user_input) > self.MAX_PROMPT_LENGTH:
+            logger.warning(f"Input too long: {len(user_input)} chars")
+            raise OrchestratorError("Input too long")
+        
+        # 2. Check for dangerous patterns
+        for pattern in self.DANGEROUS_PATTERNS:
+            if re.search(pattern, user_input, re.IGNORECASE):
+                logger.warning(f"Potential prompt injection detected: {pattern}")
+                raise OrchestratorError("Input contains prohibited patterns")
+        
+        # 3. Check special character ratio
+        if len(user_input) > 0:
+            special_chars = sum(1 for c in user_input if not c.isalnum() and not c.isspace())
+            if special_chars / len(user_input) > self.MAX_SPECIAL_CHARS_RATIO:
+                logger.warning(f"Too many special characters: {special_chars}/{len(user_input)}")
+                raise OrchestratorError("Input contains too many special characters")
+        
+        # 4. Remove control characters
+        sanitized = ''.join(char for char in user_input if ord(char) >= 32 or char in '\n\r\t')
+        
+        # 5. Escape potential injection markers
+        sanitized = sanitized.replace('[SYSTEM]', '[REDACTED]')
+        sanitized = sanitized.replace('[ADMIN]', '[REDACTED]')
+        
+        return sanitized
+
+
 class MarketingOrchestrator:
     """
     Master Orchestrator for Marketing Analytics queries.
@@ -43,6 +95,7 @@ class MarketingOrchestrator:
     
     def __init__(self):
         """Initialize the orchestrator with ChatGoogleGenerativeAI and ConversationManager."""
+        self.security_filter = PromptSecurityFilter()
         api_key = os.getenv("GOOGLE_API_KEY")
 
         if not api_key or api_key == "your_openai_api_key_here":
@@ -192,22 +245,29 @@ Respond with ONLY the category name (one word)."""
             logger.warning("Empty query received")
             raise OrchestratorError("Query cannot be empty")
         
+        # Sanitize user input to prevent prompt injection
+        try:
+            sanitized_query = self.security_filter.sanitize_input(user_query)
+        except OrchestratorError as e:
+            logger.error(f"Input sanitization failed: {str(e)}")
+            raise
+        
         history_len = len(chat_history) if chat_history else 0
-        logger.info(f"Processing query - Length: {len(user_query)} chars, File: {bool(file_content)}, History: {history_len} msgs")
-        logger.debug(f"Query content: {user_query[:100]}...")
+        logger.info(f"Processing query - Length: {len(sanitized_query)} chars, File: {bool(file_content)}, History: {history_len} msgs")
+        logger.debug(f"Query content (sanitized): {sanitized_query[:100]}...")
         
         try:
             # If file content is provided, check if this is an audit request
             if file_content and file_type:
                 logger.info(f"File provided ({file_type}) - Classifying intent for routing")
-                intent = await self._classify_intent(user_query)
+                intent = await self._classify_intent(sanitized_query)
                 
                 if "audit" in intent:
                     logger.info("Routing to Analytics Auditor agent")
                     try:
                         auditor = AnalyticsAuditor()
                         result = await auditor.analyze_configuration(
-                            user_query, file_content, file_type
+                            sanitized_query, file_content, file_type
                         )
                         logger.info("Audit analysis completed successfully")
                         return str(result)
@@ -220,7 +280,7 @@ Respond with ONLY the category name (one word)."""
 
 You uploaded a {file_type.upper()} file, but your query doesn't appear to be an audit request.
 
-**Your Query:** {user_query}
+**Your Query:** {sanitized_query}
 **Detected Intent:** {intent.title()}
 
 **To analyze this file, please:**
@@ -248,12 +308,12 @@ You uploaded a {file_type.upper()} file, but your query doesn't appear to be an 
                     chat_history,
                     self.system_prompt
                 )
-                # Add current query
-                messages.append(HumanMessage(content=user_query))
+                # Add current query (sanitized)
+                messages.append(HumanMessage(content=sanitized_query))
             else:
                 # Fallback to basic history injection
                 logger.info("Using basic message history (no conversation manager)")
-                messages = self._build_message_history(chat_history, user_query)
+                messages = self._build_message_history(chat_history, sanitized_query)
             
             logger.debug(f"Sending request to Gemini API with {len(messages)} messages")
             response = await self.llm.ainvoke(messages)
