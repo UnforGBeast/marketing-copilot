@@ -1,609 +1,545 @@
 """
-Streamlit Frontend for Marketing Analytics Copilot.
+Streamlit Frontend for Marketing Analytics Copilot SaaS.
 
-This module provides the user interface for interacting with
-the Marketing Analytics Copilot backend.
+Handles authentication, subscription management, and the core chat interface.
 """
-
-import streamlit as st
-import requests
-import logging
 import json
-from typing import Dict, Any, Optional, List
-from datetime import datetime
+import logging
+import os
 import uuid
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
-# Setup logger
+import requests
+import streamlit as st
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration
-BACKEND_URL = "http://localhost:8001"
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8001")
 MAX_MESSAGE_LENGTH = 2000
 
-# Page configuration
 st.set_page_config(
     page_title="Marketing Analytics Copilot",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="collapsed",
 )
 
+# ---------------------------------------------------------------------------
+# Session state init
+# ---------------------------------------------------------------------------
 
-def initialize_session_state():
-    """Initialize session state variables."""
-    if "processed_file_id" not in st.session_state:
-        st.session_state.processed_file_id = None
-    if "messages" not in st.session_state:
-        st.session_state.messages = [
-            {
-                "role": "assistant",
-                "content": """👋 **Welcome to the Marketing Analytics Copilot!**
-
-I'm your AI assistant for marketing analytics. I can help you with:
-
-🔍 **Marketing Audits** - Performance reviews, campaign analysis, ROI assessments
-📊 **Attribution Analysis** - Channel analysis, customer journey mapping, multi-touch attribution
-🎯 **KPI Strategy** - Metric definition, goal setting, performance frameworks
-💬 **General Questions** - Marketing advice, best practices, and guidance
-
-**✨ NEW in Sprint 3: Conversation Memory!**
-- I now remember our conversation context
-- Ask follow-up questions naturally
-- Reference previous topics without repeating yourself
-- Multi-turn conversations with full context awareness
-
-**Sprint 2 Features:**
-- Upload GTM configurations (JSON/CSV) for comprehensive audits
-- Get detailed reports with Critical Issues, Warnings, and Optimizations
-- Powered by Gemini 2.5-flash with massive context window
-
-**How to use:**
-1. Upload a file using the sidebar (optional)
-2. Ask your question or request an audit
-3. Continue the conversation with follow-up questions
-4. Get instant analysis and recommendations
-
-How can I assist you today?"""
-            }
-        ]
-        logger.info("Session state initialized with welcome message")
+def _init_session():
+    defaults = {
+        "auth_token": None,
+        "refresh_token": None,
+        "user_info": None,       # {user_id, email, full_name, plan}
+        "usage_info": None,      # populated after login
+        "messages": [],
+        "processed_file_id": None,
+        "confirm_clear": False,
+        "auth_page": "login",    # "login" | "register"
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
 
 
-def call_backend_api(message: str, chat_history: List[Dict[str, str]], uploaded_file=None) -> Optional[Dict[str, Any]]:
-    """
-    Call the backend API with a user message, chat history, and optional file.
-    
-    Args:
-        message: The user's message
-        chat_history: List of previous conversation messages
-        uploaded_file: Optional Streamlit UploadedFile object
-        
-    Returns:
-        API response as dictionary, or None if error
-    """
+def _welcome_message() -> Dict[str, str]:
+    return {
+        "role": "assistant",
+        "content": (
+            "**Welcome to Marketing Analytics Copilot!**\n\n"
+            "I can help you with:\n\n"
+            "- **Marketing Audits** — GTM configs, campaign ROI, tag validation\n"
+            "- **Attribution Analysis** — channel mapping, multi-touch models\n"
+            "- **KPI Strategy** — goal frameworks, metric definition\n"
+            "- **General Questions** — best practices and guidance\n\n"
+            "Upload a GTM JSON/CSV from the sidebar (Pro/Enterprise), or just ask a question."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# API helpers
+# ---------------------------------------------------------------------------
+
+def _auth_headers() -> Dict[str, str]:
+    token = st.session_state.get("auth_token")
+    if not token:
+        return {}
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _try_refresh() -> bool:
+    """Attempt to get a new access token using the stored refresh token."""
+    rt = st.session_state.get("refresh_token")
+    if not rt:
+        return False
     try:
-        logger.info(f"Calling backend API - Message length: {len(message)} chars, History: {len(chat_history)} msgs, File: {uploaded_file.name if uploaded_file else 'None'}")
-        
-        # Prepare multipart form data
-        files = {}
-        data = {
-            "message": message,
-            "chat_history": json.dumps(chat_history)  # Serialize history to JSON string
-        }
-        
-        if uploaded_file:
-            files["file"] = (
-                uploaded_file.name,
-                uploaded_file.getvalue(),
-                uploaded_file.type
+        r = requests.post(
+            f"{BACKEND_URL}/auth/refresh",
+            json={"refresh_token": rt},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            st.session_state.auth_token = r.json()["access_token"]
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def api_get(path: str, **kwargs) -> Optional[Dict]:
+    try:
+        r = requests.get(f"{BACKEND_URL}{path}", headers=_auth_headers(), timeout=15, **kwargs)
+        if r.status_code == 401 and _try_refresh():
+            r = requests.get(f"{BACKEND_URL}{path}", headers=_auth_headers(), timeout=15, **kwargs)
+        if r.status_code == 200:
+            return r.json()
+        logger.warning("GET %s returned %s", path, r.status_code)
+        return None
+    except Exception as exc:
+        logger.error("GET %s error: %s", path, exc)
+        return None
+
+
+def api_post(path: str, json_body: Optional[dict] = None, **kwargs) -> Optional[requests.Response]:
+    try:
+        r = requests.post(
+            f"{BACKEND_URL}{path}",
+            headers=_auth_headers(),
+            json=json_body,
+            timeout=30,
+            **kwargs,
+        )
+        if r.status_code == 401 and _try_refresh():
+            r = requests.post(
+                f"{BACKEND_URL}{path}",
+                headers=_auth_headers(),
+                json=json_body,
+                timeout=30,
+                **kwargs,
             )
-            logger.info(f"Uploading file: {uploaded_file.name} ({uploaded_file.size} bytes)")
-        
-        response = requests.post(
+        return r
+    except Exception as exc:
+        logger.error("POST %s error: %s", path, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Auth pages
+# ---------------------------------------------------------------------------
+
+def _page_login():
+    st.title("📊 Marketing Analytics Copilot")
+    st.markdown("Sign in to your account")
+
+    col, _ = st.columns([1, 1])
+    with col:
+        with st.form("login_form"):
+            email = st.text_input("Email", placeholder="you@example.com")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Sign In", use_container_width=True, type="primary")
+
+        if submitted:
+            if not email or not password:
+                st.error("Please enter your email and password.")
+            else:
+                r = api_post("/auth/login", {"email": email, "password": password})
+                if r is None:
+                    st.error("Cannot reach the server. Is the backend running?")
+                elif r.status_code == 200:
+                    data = r.json()
+                    st.session_state.auth_token = data["access_token"]
+                    st.session_state.refresh_token = data["refresh_token"]
+                    st.session_state.user_info = {
+                        "user_id": data["user_id"],
+                        "email": data["email"],
+                        "full_name": data.get("full_name") or "",
+                        "plan": data["plan"],
+                    }
+                    st.session_state.messages = [_welcome_message()]
+                    _refresh_usage()
+                    st.rerun()
+                elif r.status_code == 401:
+                    st.error("Invalid email or password.")
+                else:
+                    st.error(f"Login failed: {r.json().get('error', 'Unknown error')}")
+
+        st.markdown("---")
+        if st.button("Create a free account", use_container_width=True):
+            st.session_state.auth_page = "register"
+            st.rerun()
+
+
+def _page_register():
+    st.title("📊 Marketing Analytics Copilot")
+    st.markdown("Create your free account")
+
+    col, _ = st.columns([1, 1])
+    with col:
+        with st.form("register_form"):
+            full_name = st.text_input("Full Name (optional)")
+            email = st.text_input("Email", placeholder="you@example.com")
+            password = st.text_input(
+                "Password",
+                type="password",
+                help="Min 8 characters, must include uppercase, lowercase, and a digit",
+            )
+            confirm = st.text_input("Confirm Password", type="password")
+            submitted = st.form_submit_button("Create Account", use_container_width=True, type="primary")
+
+        if submitted:
+            if not email or not password:
+                st.error("Email and password are required.")
+            elif password != confirm:
+                st.error("Passwords do not match.")
+            else:
+                r = api_post("/auth/register", {"email": email, "password": password, "full_name": full_name})
+                if r is None:
+                    st.error("Cannot reach the server.")
+                elif r.status_code == 200:
+                    data = r.json()
+                    st.session_state.auth_token = data["access_token"]
+                    st.session_state.refresh_token = data["refresh_token"]
+                    st.session_state.user_info = {
+                        "user_id": data["user_id"],
+                        "email": data["email"],
+                        "full_name": data.get("full_name") or "",
+                        "plan": data["plan"],
+                    }
+                    st.session_state.messages = [_welcome_message()]
+                    _refresh_usage()
+                    st.success("Account created! Welcome aboard.")
+                    st.rerun()
+                elif r.status_code == 409:
+                    st.error("An account with this email already exists.")
+                elif r.status_code == 400:
+                    st.error(r.json().get("error", "Invalid input."))
+                else:
+                    st.error("Registration failed. Please try again.")
+
+        st.markdown("---")
+        if st.button("Already have an account? Sign in", use_container_width=True):
+            st.session_state.auth_page = "login"
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Usage refresh
+# ---------------------------------------------------------------------------
+
+def _refresh_usage():
+    data = api_get("/user/usage")
+    if data:
+        st.session_state.usage_info = data
+        if st.session_state.user_info:
+            st.session_state.user_info["plan"] = data["plan"]
+
+
+# ---------------------------------------------------------------------------
+# Conversation helpers
+# ---------------------------------------------------------------------------
+
+def _call_chat_api(
+    message: str,
+    history: List[Dict[str, str]],
+    uploaded_file=None,
+) -> Optional[Dict[str, Any]]:
+    data = {"message": message, "chat_history": json.dumps(history)}
+    files = {}
+    if uploaded_file:
+        files["file"] = (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)
+
+    try:
+        r = requests.post(
             f"{BACKEND_URL}/chat",
+            headers=_auth_headers(),
             data=data,
             files=files if files else None,
-            timeout=60  # Longer timeout for file processing
+            timeout=90,
         )
-        
-        response.raise_for_status()
-        result = response.json()
-        
-        logger.info(f"Backend API call successful - Status: {response.status_code}")
-        return result
-        
+        if r.status_code == 401 and _try_refresh():
+            r = requests.post(
+                f"{BACKEND_URL}/chat",
+                headers=_auth_headers(),
+                data=data,
+                files=files if files else None,
+                timeout=90,
+            )
+
+        if r.status_code == 200:
+            _refresh_usage()
+            return r.json()
+        elif r.status_code == 401:
+            st.error("Session expired. Please sign in again.")
+            _logout()
+        elif r.status_code == 403:
+            st.warning(r.json().get("error", "Action not permitted on your current plan."))
+        elif r.status_code == 429:
+            st.warning(r.json().get("error", "Usage limit reached."))
+        elif r.status_code == 503:
+            st.error("AI service temporarily unavailable. Please try again.")
+        else:
+            st.error(f"Error {r.status_code}: {r.json().get('error', 'Unknown error')}")
+        return None
+
     except requests.exceptions.ConnectionError:
-        logger.error("Connection error: Backend unreachable")
-        st.error("""❌ **Cannot connect to backend server.**
-
-**Troubleshooting:**
-1. Ensure the FastAPI server is running on port 8000
-2. Start the backend with: `cd backend && uvicorn main:app --reload`
-3. Check if port 8000 is available
-
-**Need help?** See the README.md for detailed setup instructions.""")
+        st.error("Cannot connect to the backend server.")
         return None
-        
     except requests.exceptions.Timeout:
-        logger.error("Request timeout")
-        st.error("""⏱️ **Request timed out.**
-
-The server took too long to respond (>30 seconds).
-
-**Possible causes:**
-- OpenAI API is slow or rate-limited
-- Network connectivity issues
-- Server is processing a complex query
-
-Please try again in a moment.""")
-        return None
-        
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error: {e.response.status_code}")
-        try:
-            error_detail = e.response.json().get("error", "Unknown error")
-            st.error(f"""❌ **Server Error ({e.response.status_code})**
-
-{error_detail}
-
-**Common issues:**
-- **503**: Check your OpenAI API key in the `.env` file
-- **400**: Message validation failed
-- **500**: Internal server error - check backend logs""")
-        except:
-            st.error(f"""❌ **Server Error ({e.response.status_code})**
-
-An error occurred on the server. Please check the backend logs and try again.""")
-        return None
-        
-    except requests.exceptions.JSONDecodeError:
-        logger.error("JSON decode error")
-        st.error("""❌ **Invalid response from server.**
-
-Received malformed data from the backend. This might indicate:
-- Server configuration issue
-- Unexpected error format
-
-Please check the backend logs for details.""")
-        return None
-        
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
-        st.error(f"""❌ **Unexpected error occurred.**
-
-{str(e)}
-
-Please try again or contact support if the issue persists.""")
+        st.error("Request timed out. The server may be processing a large file.")
         return None
 
 
-def validate_message(message: str) -> bool:
-    """
-    Validate user message.
-    
-    Args:
-        message: The user's message
-        
-    Returns:
-        True if valid, False otherwise
-    """
-    if not message or not message.strip():
-        st.warning("⚠️ Please enter a message before sending.")
-        return False
-    
-    if len(message) > MAX_MESSAGE_LENGTH:
-        st.warning(f"⚠️ Message too long. Maximum {MAX_MESSAGE_LENGTH} characters allowed. Current: {len(message)} characters.")
-        return False
-    
-    return True
-
-
-def calculate_conversation_stats(messages: List[Dict[str, str]]) -> Dict[str, Any]:
-    """
-    Calculate conversation statistics.
-    
-    Args:
-        messages: List of conversation messages
-        
-    Returns:
-        Dictionary with statistics
-    """
-    # Filter out welcome message
-    actual_messages = [
-        msg for msg in messages
-        if not (msg["role"] == "assistant" and "Welcome to the Marketing Analytics Copilot" in msg["content"])
-    ]
-    
-    user_messages = [m for m in actual_messages if m["role"] == "user"]
-    assistant_messages = [m for m in actual_messages if m["role"] == "assistant"]
-    
-    # Estimate tokens (rough: 1 token ≈ 4 characters)
-    total_chars = sum(len(m["content"]) for m in actual_messages)
-    estimated_tokens = total_chars // 4
-    
-    return {
-        "total_messages": len(actual_messages),
-        "user_messages": len(user_messages),
-        "assistant_messages": len(assistant_messages),
-        "estimated_tokens": estimated_tokens
-    }
-
-
-def export_conversation(messages: List[Dict[str, str]]) -> str:
-    """
-    Export conversation to JSON string.
-    
-    Args:
-        messages: List of conversation messages
-        
-    Returns:
-        JSON string of exported conversation
-    """
-    # Filter out welcome message
-    export_messages = [
-        msg for msg in messages
-        if not (msg["role"] == "assistant" and "Welcome to the Marketing Analytics Copilot" in msg["content"])
-    ]
-    
-    stats = calculate_conversation_stats(messages)
-    
-    export_data = {
-        "version": "1.0",
+def _export_conversation(messages: List[Dict]) -> str:
+    exportable = [m for m in messages if m["role"] != "assistant" or "Welcome to" not in m["content"]]
+    return json.dumps({
+        "version": "2.0",
         "exported_at": datetime.utcnow().isoformat() + "Z",
         "conversation_id": str(uuid.uuid4()),
-        "metadata": {
-            "message_count": stats["total_messages"],
-            "user_messages": stats["user_messages"],
-            "assistant_messages": stats["assistant_messages"],
-            "estimated_tokens": stats["estimated_tokens"]
-        },
-        "messages": [
-            {
-                "role": msg["role"],
-                "content": msg["content"],
-                "timestamp": datetime.utcnow().isoformat() + "Z"
-            }
-            for msg in export_messages
-        ]
-    }
-    
-    return json.dumps(export_data, indent=2)
+        "messages": exportable,
+    }, indent=2)
 
 
-def validate_import_data(data: dict) -> tuple:
-    """
-    Validate imported conversation data.
-    
-    Args:
-        data: Parsed JSON data
-        
-    Returns:
-        Tuple of (is_valid: bool, error_message: str)
-    """
-    required_fields = ["version", "messages"]
-    
-    if not all(field in data for field in required_fields):
-        return False, "Missing required fields (version, messages)"
-    
-    if not isinstance(data["messages"], list):
-        return False, "Messages must be a list"
-    
-    if len(data["messages"]) == 0:
-        return False, "No messages found in file"
-    
-    for i, msg in enumerate(data["messages"]):
-        if "role" not in msg or "content" not in msg:
-            return False, f"Invalid message format at index {i}"
-        if msg["role"] not in ["user", "assistant"]:
-            return False, f"Invalid role '{msg['role']}' at index {i}"
-    
-    return True, "Valid"
-
-
-def import_conversation(uploaded_file) -> bool:
-    """
-    Import conversation from JSON file.
-    
-    Args:
-        uploaded_file: Streamlit UploadedFile object
-        
-    Returns:
-        True if successful, False otherwise
-    """
+def _import_conversation(uploaded_file) -> bool:
     try:
         data = json.loads(uploaded_file.getvalue())
-        is_valid, error_msg = validate_import_data(data)
-        
-        if not is_valid:
-            st.error(f"❌ Invalid conversation file: {error_msg}")
+        msgs = data.get("messages", [])
+        if not msgs:
+            st.error("No messages found in file.")
             return False
-        
-        # Add welcome message first
-        imported_messages = [
-            {
-                "role": "assistant",
-                "content": """👋 **Conversation Restored!**
-
-This conversation was imported from a saved file. You can continue where you left off.
-
-How can I assist you today?"""
-            }
-        ]
-        
-        # Add imported messages
-        for msg in data["messages"]:
-            imported_messages.append({
-                "role": msg["role"],
-                "content": msg["content"]
-            })
-        
-        # Load messages into session state
-        st.session_state.messages = imported_messages
-        st.success(f"✅ Imported {len(data['messages'])} messages successfully!")
-        logger.info(f"Conversation imported - {len(data['messages'])} messages")
+        st.session_state.messages = [_welcome_message()] + msgs
+        st.success(f"Imported {len(msgs)} messages.")
         return True
-        
-    except json.JSONDecodeError:
-        st.error("❌ Invalid JSON file. Please upload a valid conversation export.")
-        return False
-    except Exception as e:
-        st.error(f"❌ Error importing conversation: {str(e)}")
-        logger.error(f"Import error: {str(e)}")
+    except Exception as exc:
+        st.error(f"Import failed: {exc}")
         return False
 
 
-def clear_conversation():
-    """Clear conversation history and reset to welcome message."""
-    st.session_state.messages = [
-        {
-            "role": "assistant",
-            "content": """👋 **Welcome to the Marketing Analytics Copilot!**
-
-I'm your AI assistant for marketing analytics. I can help you with:
-
-🔍 **Marketing Audits** - Performance reviews, campaign analysis, ROI assessments
-📊 **Attribution Analysis** - Channel analysis, customer journey mapping, multi-touch attribution
-🎯 **KPI Strategy** - Metric definition, goal setting, performance frameworks
-💬 **General Questions** - Marketing advice, best practices, and guidance
-
-**✨ NEW in Sprint 3 Part 2: Advanced Conversation Features!**
-- 📝 Automatic summarization for long conversations
-- 🔍 Semantic search to find relevant context
-- 💾 Export and import conversations
-- 🗑️ Clear history with one click
-
-**Sprint 2 Features:**
-- Upload GTM configurations (JSON/CSV) for comprehensive audits
-- Get detailed reports with Critical Issues, Warnings, and Optimizations
-- Powered by Gemini 2.5-flash with massive context window
-
-**How to use:**
-1. Upload a file using the sidebar (optional)
-2. Ask your question or request an audit
-3. Continue the conversation with follow-up questions
-4. Manage your conversation using the sidebar tools
-
-How can I assist you today?"""
-        }
-    ]
-    st.session_state.confirm_clear = False
-    logger.info("Conversation history cleared")
+def _logout():
+    for key in ("auth_token", "refresh_token", "user_info", "usage_info", "messages"):
+        st.session_state[key] = None if key not in ("messages",) else []
+    st.session_state.auth_page = "login"
+    st.rerun()
 
 
-def display_chat_message(role: str, content: str):
-    """
-    Display a chat message with appropriate styling.
-    
-    Args:
-        role: Message role (user or assistant)
-        content: Message content
-    """
-    with st.chat_message(role):
-        st.markdown(content)
+# ---------------------------------------------------------------------------
+# Subscription sidebar section
+# ---------------------------------------------------------------------------
+
+def _sidebar_subscription():
+    user = st.session_state.user_info or {}
+    usage = st.session_state.usage_info or {}
+
+    plan = user.get("plan", "free").capitalize()
+    st.markdown(f"**Signed in as:** {user.get('email', '')}")
+    st.markdown(f"**Plan:** {plan}")
+
+    if usage:
+        st.markdown("**Usage:**")
+        daily_limit = usage.get("daily_limit")
+        monthly_limit = usage.get("monthly_limit")
+        today = usage.get("messages_today", 0)
+        month = usage.get("messages_this_month", 0)
+
+        if daily_limit:
+            st.progress(min(today / daily_limit, 1.0), text=f"Today: {today}/{daily_limit}")
+        else:
+            st.caption(f"Today: {today} messages")
+
+        if monthly_limit:
+            st.progress(min(month / monthly_limit, 1.0), text=f"This month: {month}/{monthly_limit}")
+        elif monthly_limit is None and user.get("plan") != "free":
+            st.caption(f"This month: {month} messages (unlimited)")
+
+    current_plan = user.get("plan", "free")
+    if current_plan == "free":
+        if st.button("Upgrade to Pro — $29/mo", use_container_width=True, type="primary"):
+            r = api_post("/subscription/checkout", {"plan": "pro"})
+            if r and r.status_code == 200:
+                url = r.json().get("checkout_url")
+                if url:
+                    st.markdown(f"[Complete payment]({url})", unsafe_allow_html=True)
+                    st.info("Click the link above to complete your upgrade.")
+            else:
+                msg = r.json().get("error", "Could not create checkout session.") if r else "Server error."
+                st.error(msg)
+
+        if st.button("Upgrade to Enterprise — $99/mo", use_container_width=True):
+            r = api_post("/subscription/checkout", {"plan": "enterprise"})
+            if r and r.status_code == 200:
+                url = r.json().get("checkout_url")
+                if url:
+                    st.markdown(f"[Complete payment]({url})", unsafe_allow_html=True)
+            else:
+                msg = r.json().get("error", "Could not create checkout session.") if r else "Server error."
+                st.error(msg)
+
+    else:
+        if st.button("Manage Billing", use_container_width=True):
+            r = api_post("/subscription/portal")
+            if r and r.status_code == 200:
+                url = r.json().get("portal_url")
+                if url:
+                    st.markdown(f"[Open billing portal]({url})", unsafe_allow_html=True)
+            else:
+                msg = r.json().get("error", "Could not open billing portal.") if r else "Server error."
+                st.error(msg)
+
+    st.divider()
+    if st.button("Sign Out", use_container_width=True):
+        _logout()
 
 
-def main():
-    """Main application function."""
-    # Initialize session state
-    initialize_session_state()
-    
-    # Header
+# ---------------------------------------------------------------------------
+# Main app page
+# ---------------------------------------------------------------------------
+
+def _page_app():
+    # Handle Stripe redirect query params
+    params = st.query_params
+    if params.get("payment_status") == "success":
+        st.success("Payment successful! Your plan has been upgraded.")
+        _refresh_usage()
+        st.query_params.clear()
+    elif params.get("payment_status") == "cancelled":
+        st.info("Payment cancelled. You remain on your current plan.")
+        st.query_params.clear()
+
     st.title("📊 Marketing Analytics Copilot")
-    st.markdown("**Sprint 2: Analytics Auditor** - *File Upload & GTM Audit Analysis*")
-    
-    # Sidebar
+
     with st.sidebar:
-        # Conversation Management Section
-        st.header("💬 Conversation Management")
-        
-        # Calculate and display stats
-        stats = calculate_conversation_stats(st.session_state.messages)
-        
-        st.markdown("**📊 Statistics:**")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Messages", stats["total_messages"])
-            st.metric("User", stats["user_messages"])
-        with col2:
-            st.metric("Est. Tokens", f"{stats['estimated_tokens']:,}")
-            st.metric("Assistant", stats["assistant_messages"])
-        
-        st.divider()
-        
-        # Action buttons
-        st.markdown("**🔧 Actions:**")
-        
-        # Export button
-        if stats["total_messages"] > 0:
-            export_json = export_conversation(st.session_state.messages)
+        st.header("Account")
+        _sidebar_subscription()
+
+        st.header("Conversation")
+        messages = st.session_state.messages
+        user_msgs = [m for m in messages if m["role"] == "user"]
+        st.caption(f"{len(user_msgs)} messages in this session")
+
+        if len(user_msgs) > 0:
+            export_data = _export_conversation(messages)
             st.download_button(
-                label="📥 Export Conversation",
-                data=export_json,
+                "Export Conversation",
+                data=export_data,
                 file_name=f"conversation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
                 mime="application/json",
-                help="Download conversation as JSON file",
-                use_container_width=True
+                use_container_width=True,
             )
-        else:
-            st.button(
-                "📥 Export Conversation",
-                disabled=True,
-                help="No messages to export",
-                use_container_width=True
-            )
-        
-        # Import button
-        import_file = st.file_uploader(
-            "📤 Import Conversation",
-            type=['json'],
-            help="Upload a previously exported conversation",
-            key="import_uploader"
-        )
-        
-        if import_file:
-            if st.button("Load Imported Conversation", use_container_width=True):
-                if import_conversation(import_file):
-                    st.rerun()
-        
-        # Clear button with confirmation
-        if stats["total_messages"] > 0:
-            if "confirm_clear" not in st.session_state:
-                st.session_state.confirm_clear = False
-            
+
+        import_file = st.file_uploader("Import Conversation", type=["json"], key="import_uploader")
+        if import_file and st.button("Load", use_container_width=True):
+            if _import_conversation(import_file):
+                st.rerun()
+
+        if len(user_msgs) > 0:
             if not st.session_state.confirm_clear:
-                if st.button("🗑️ Clear History", type="secondary", use_container_width=True):
+                if st.button("Clear History", use_container_width=True):
                     st.session_state.confirm_clear = True
                     st.rerun()
             else:
-                st.warning("⚠️ Are you sure? This cannot be undone.")
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("✅ Yes, Clear", type="primary", use_container_width=True):
-                        clear_conversation()
-                        st.rerun()
-                with col2:
-                    if st.button("❌ Cancel", use_container_width=True):
+                st.warning("This cannot be undone.")
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("Clear", type="primary", use_container_width=True):
+                        st.session_state.messages = [_welcome_message()]
                         st.session_state.confirm_clear = False
                         st.rerun()
-        else:
-            st.button(
-                "🗑️ Clear History",
-                disabled=True,
-                help="No messages to clear",
-                use_container_width=True
+                with c2:
+                    if st.button("Cancel", use_container_width=True):
+                        st.session_state.confirm_clear = False
+                        st.rerun()
+
+        st.divider()
+        st.header("Upload File")
+
+        usage = st.session_state.usage_info or {}
+        can_upload = usage.get("file_uploads_allowed", False)
+
+        if can_upload:
+            max_mb = usage.get("max_file_size_mb", 10)
+            uploaded_file = st.file_uploader(
+                "GTM Configuration (JSON/CSV)",
+                type=["json", "csv"],
+                help=f"Max {max_mb} MB on your plan",
+                key="file_uploader",
             )
-        
-        st.divider()
-        
-        # About section
-        st.header("ℹ️ About")
-        st.markdown("""
-**Sprint 3 Part 2** - Advanced Conversation Features
-
-**New Features:**
-- 📝 Auto-summarization (>10 msgs)
-- 🔍 Semantic search
-- 💾 Export/Import conversations
-- 🗑️ Clear history
-
-**Sprint 2 Features:**
-- ✅ File upload (JSON/CSV)
-- ✅ GTM configuration audits
-- ✅ Conversation memory
-- ✅ Gemini 2.5-flash integration
-        """)
-        
-        st.divider()
-        
-        st.header("📎 Upload File")
-        uploaded_file = st.file_uploader(
-            "Upload GTM Configuration",
-            type=['json', 'csv'],
-            help="Upload a JSON or CSV file for audit analysis (max 10MB)",
-            key="file_uploader"
-        )
-        
-        if uploaded_file:
-            st.success(f"✅ File loaded: {uploaded_file.name}")
-            st.caption(f"Size: {uploaded_file.size / 1024:.1f} KB")
-            st.caption(f"Type: {uploaded_file.type}")
+            if uploaded_file:
+                st.success(f"{uploaded_file.name} ({uploaded_file.size / 1024:.1f} KB)")
         else:
-            st.info("💡 Upload a file to enable audit analysis")
-        
+            uploaded_file = None
+            st.info("File uploads require Pro or Enterprise. Upgrade from the Account section above.")
+
         st.divider()
-        
-        st.header("🔧 System Status")
-        # Check backend health
+        st.header("System Status")
         try:
-            health_response = requests.get(f"{BACKEND_URL}/", timeout=5)
-            if health_response.status_code == 200:
-                st.success("✅ Backend: Connected")
+            hr = requests.get(f"{BACKEND_URL}/", timeout=5)
+            if hr.status_code == 200:
+                st.success("Backend: Connected")
             else:
-                st.error("❌ Backend: Error")
-        except:
-            st.error("❌ Backend: Offline")
-    
-    st.divider()
-    
-    # Display chat history
-    for message in st.session_state.messages:
-        display_chat_message(message["role"], message["content"])
-    
+                st.error("Backend: Error")
+        except Exception:
+            st.error("Backend: Offline")
+
+    # Chat history
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
     # Chat input
-    if prompt := st.chat_input("Ask me about marketing analytics...", max_chars=MAX_MESSAGE_LENGTH):
-        # Validate message
-        if not validate_message(prompt):
+    if prompt := st.chat_input("Ask about marketing analytics...", max_chars=MAX_MESSAGE_LENGTH):
+        if not prompt.strip():
+            st.warning("Please enter a message.")
             return
-        
-        # Build user message with file info if present
-        user_message = prompt
-        if uploaded_file:
-            user_message += f"\n\n📎 *Attached: {uploaded_file.name}*"
-        
-        # Add user message to chat
-        st.session_state.messages.append({"role": "user", "content": user_message})
-        display_chat_message("user", user_message)
-        
-        # Get assistant response
+
+        display_msg = prompt
+        if "uploaded_file" in dir() and uploaded_file:
+            display_msg += f"\n\n*Attached: {uploaded_file.name}*"
+
+        st.session_state.messages.append({"role": "user", "content": display_msg})
+        with st.chat_message("user"):
+            st.markdown(display_msg)
+
+        # Filter welcome from history sent to backend
+        history = [
+            m for m in st.session_state.messages[:-1]
+            if not (m["role"] == "assistant" and "Welcome to Marketing Analytics Copilot" in m["content"])
+        ]
+
         with st.chat_message("assistant"):
-            # Show different spinner based on file presence
-            spinner_text = "🔍 Analyzing file and generating audit report..." if uploaded_file else "🤔 Analyzing your query..."
-            
+            spinner_text = "Analyzing file and generating report..." if (can_upload and uploaded_file) else "Thinking..."
             with st.spinner(spinner_text):
-                # Filter out welcome message from history (it's not part of the conversation)
-                filtered_history = [
-                    msg for msg in st.session_state.messages[:-1]  # Exclude the just-added user message
-                    if not (msg["role"] == "assistant" and "Welcome to the Marketing Analytics Copilot" in msg["content"])
-                ]
-                
-                response_data = call_backend_api(prompt, filtered_history, uploaded_file)
-                
-                if response_data and response_data.get("status") == "success":
-                    response_text = response_data.get("response", "No response received.")
-                    st.markdown(response_text)
-                    
-                    # Add to chat history
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": response_text
-                    })
-                    logger.info("Response added to chat history")
-                    
-                    # Clear file after successful processing
-                    if uploaded_file:
-                        st.info("✅ File processed successfully. Upload a new file for another analysis.")
-                else:
-                    # Error already displayed by call_backend_api
-                    logger.warning("Failed to get valid response from backend")
-    
-    # Footer
+                result = _call_chat_api(prompt, history, uploaded_file if can_upload else None)
+
+            if result and result.get("status") == "success":
+                text = result.get("response", "No response received.")
+                st.markdown(text)
+                st.session_state.messages.append({"role": "assistant", "content": text})
+            # Error already shown by _call_chat_api
+
     st.divider()
-    st.caption("Marketing Analytics Copilot v2.0.0 | Sprint 3 Part 2: Advanced Conversations | Powered by LangChain & Gemini")
+    plan_name = (st.session_state.user_info or {}).get("plan", "free").capitalize()
+    st.caption(f"Marketing Analytics Copilot v3.0.0 | Plan: {plan_name} | Powered by Gemini & LangChain")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    _init_session()
+
+    if not st.session_state.auth_token:
+        if st.session_state.auth_page == "register":
+            _page_register()
+        else:
+            _page_login()
+    else:
+        _page_app()
 
 
 if __name__ == "__main__":
-    logger.info("Starting Streamlit application")
     main()
-
-# Made with Bob
